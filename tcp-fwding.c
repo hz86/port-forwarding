@@ -162,12 +162,11 @@ typedef struct pf_session_t {
 } pf_session_t;
 
 // 内部函数声明
-static void post_init(pf_tcp_t* pf);
 static int post_accept(pf_tcp_t* pf);
 static int post_connect(pf_tcp_t* pf, pf_session_t* session);
 static int post_timeout(pf_tcp_t* pf, pf_session_t* session);
-static int post_recv(pf_tcp_t* pf, pf_io_context_t* context, WSABUF* buf, pf_io_type_t type);
-static int post_send(pf_tcp_t* pf, pf_io_context_t* context, WSABUF* buf, pf_io_type_t type);
+static int post_recv(pf_tcp_t* pf, pf_session_t* session, pf_io_type_t type);
+static int post_send(pf_tcp_t* pf, pf_session_t* session, pf_io_type_t type);
 static pf_session_t* session_create(pf_tcp_t* pf);
 static void session_addref(pf_session_t* session);
 static void session_io_addref(pf_session_t* session);
@@ -414,7 +413,7 @@ int pf_tcp_start(pf_tcp_t* pf)
     // 初始投递
     for (int i = 0; i < pf->thread_count * 2; i++)
     {
-        post_init(pf);
+        post_accept(pf);
     }
 
     return 0;
@@ -459,7 +458,7 @@ int pf_tcp_stop(pf_tcp_t* pf)
 // 接受连接
 static void handle_accept(pf_tcp_t* pf, pf_io_context_t* context, int is_success)
 {
-    post_init(pf);
+    post_accept(pf);
     pf_session_t* session = context->session;
     session_io_addref(session);
 
@@ -556,7 +555,7 @@ static void handle_connect(pf_tcp_t* pf, pf_io_context_t* context, int is_succes
     // 投递源数据接收
     session->src_wsa_buffer.buf = session->src_data_buffer;
     session->src_wsa_buffer.len = sizeof(session->src_data_buffer);
-    if (-1 == post_recv(pf, &session->src_io, &session->src_wsa_buffer, PF_IO_SRC_READ))
+    if (-1 == post_recv(pf, session, PF_IO_SRC_READ))
     {
         goto ERROR_1;
     }
@@ -564,7 +563,7 @@ static void handle_connect(pf_tcp_t* pf, pf_io_context_t* context, int is_succes
     // 投递目标数据接收
     session->dst_wsa_buffer.buf = session->dst_data_buffer;
     session->dst_wsa_buffer.len = sizeof(session->dst_data_buffer);
-    if (-1 == post_recv(pf, &session->dst_io, &session->dst_wsa_buffer, PF_IO_DST_READ))
+    if (-1 == post_recv(pf, session, PF_IO_DST_READ))
     {
         goto ERROR_1;
     }
@@ -602,7 +601,7 @@ static void handle_src_read(pf_tcp_t* pf, pf_io_context_t* context, int is_succe
     // 投递目标发送
     session->src_wsa_buffer.len = bytes_transferred;
     session->src_wsa_buffer.buf = session->src_data_buffer;
-    if (-1 == post_send(pf, &session->src_io, &session->src_wsa_buffer, PF_IO_DST_WRITE))
+    if (-1 == post_send(pf, session, PF_IO_DST_WRITE))
     {
         goto ERROR_1;
     }
@@ -640,7 +639,7 @@ static void handle_dst_read(pf_tcp_t* pf, pf_io_context_t* context, int is_succe
     // 投递目标发送
     session->dst_wsa_buffer.len = bytes_transferred;
     session->dst_wsa_buffer.buf = session->dst_data_buffer;
-    if (-1 == post_send(pf, &session->dst_io, &session->dst_wsa_buffer, PF_IO_SRC_WRITE))
+    if (-1 == post_send(pf, session, PF_IO_SRC_WRITE))
     {
         goto ERROR_1;
     }
@@ -671,7 +670,7 @@ static void handle_src_write(pf_tcp_t* pf, pf_io_context_t* context, int is_succ
         // 发生部分发送，调整缓冲区并重新发送
         session->dst_wsa_buffer.buf += bytes_transferred;
         session->dst_wsa_buffer.len -= bytes_transferred;
-        if (-1 == post_send(pf, &session->dst_io, &session->dst_wsa_buffer, PF_IO_SRC_WRITE))
+        if (-1 == post_send(pf, session, PF_IO_SRC_WRITE))
         {
             goto ERROR_1;
         }
@@ -681,7 +680,7 @@ static void handle_src_write(pf_tcp_t* pf, pf_io_context_t* context, int is_succ
         // 发送完成，可以接收来自目标的新数据了
         session->dst_wsa_buffer.buf = session->dst_data_buffer;
         session->dst_wsa_buffer.len = sizeof(session->dst_data_buffer);
-        if (-1 == post_recv(pf, &session->dst_io, &session->dst_wsa_buffer, PF_IO_DST_READ))
+        if (-1 == post_recv(pf, session, PF_IO_DST_READ))
         {
             goto ERROR_1;
         }
@@ -713,7 +712,7 @@ static void handle_dst_write(pf_tcp_t* pf, pf_io_context_t* context, int is_succ
         // 发生部分发送，调整缓冲区并重新发送
         session->src_wsa_buffer.buf += bytes_transferred;
         session->src_wsa_buffer.len -= bytes_transferred;
-        if (-1 == post_send(pf, &session->src_io, &session->src_wsa_buffer, PF_IO_DST_WRITE))
+        if (-1 == post_send(pf, session, PF_IO_DST_WRITE))
         {
             goto ERROR_1;
         }
@@ -723,7 +722,7 @@ static void handle_dst_write(pf_tcp_t* pf, pf_io_context_t* context, int is_succ
         // 发送完成，可以接收来自源的新数据了
         session->src_wsa_buffer.buf = session->src_data_buffer;
         session->src_wsa_buffer.len = sizeof(session->src_data_buffer);
-        if (-1 == post_recv(pf, &session->src_io, &session->src_wsa_buffer, PF_IO_SRC_READ))
+        if (-1 == post_recv(pf, session, PF_IO_SRC_READ))
         {
             goto ERROR_1;
         }
@@ -790,15 +789,6 @@ static DWORD WINAPI thread_worker(LPVOID param)
             // 退出信号
             break;
         }
-        else if (1 == completion_key)
-        {
-            // 初始投递
-            if (-1 == post_accept(pf))
-            {
-                // 重试
-                post_init(pf);
-            }
-        }
         else
         {
             // 基础上下文
@@ -844,7 +834,7 @@ static DWORD WINAPI thread_worker(LPVOID param)
     // 最后一个线程负责清理工作
     if (0 == InterlockedDecrement(&pf->thread_actives))
     {
-        // 这里释放所有客户
+        // 这里释放所有会话
         pf_session_t* curr_session = NULL;
         ssize_t count = table_max_id(pf->session_table) + 1;
         for (ssize_t i = 0; i < count; i++)
@@ -881,12 +871,6 @@ static int parse_ip_addr(const char* ip, unsigned short port, _sockaddr_in* addr
     return -1;
 }
 
-// 初始投递
-static void post_init(pf_tcp_t* pf)
-{
-    PostQueuedCompletionStatus(pf->iocp, 0, 1, NULL);
-}
-
 // 投递Accept
 static int post_accept(pf_tcp_t* pf)
 {
@@ -919,35 +903,57 @@ ERROR_1:
 // 投递Connect
 static int post_connect(pf_tcp_t* pf, pf_session_t* session)
 {
-    DWORD addr_len;
     DWORD bytes_sent;
+    DWORD dst_addr_len, out_addr_len;
+    session_addref(session);
 
     if (AF_INET == pf->dst_sin_addr.addr.sa_family)
     {
-        addr_len = sizeof(pf->dst_sin_addr.sin4);
+        dst_addr_len = sizeof(pf->dst_sin_addr.sin4);
     }
     else if (AF_INET6 == pf->dst_sin_addr.addr.sa_family)
     {
-        addr_len = sizeof(pf->dst_sin_addr.sin6);
+        dst_addr_len = sizeof(pf->dst_sin_addr.sin6);
     }
     else
     {
-        return -1;
+        goto ERROR_1;
     }
 
-    session_addref(session);
+    if (AF_INET == pf->out_sin_addr.addr.sa_family)
+    {
+        out_addr_len = sizeof(pf->out_sin_addr.sin4);
+    }
+    else if (AF_INET6 == pf->out_sin_addr.addr.sa_family)
+    {
+        out_addr_len = sizeof(pf->out_sin_addr.sin6);
+    }
+    else
+    {
+        goto ERROR_1;
+    }
+
+    if (SOCKET_ERROR == bind(session->dst_conn,
+        &pf->out_sin_addr.addr,out_addr_len))
+    {
+        goto ERROR_1;
+    }
+
     session->dst_io.operation_type = PF_IO_CONNECT;
-    if (FALSE == pf->connectex(session->dst_conn, &pf->dst_sin_addr.addr, addr_len,
+    if (FALSE == pf->connectex(session->dst_conn, &pf->dst_sin_addr.addr, dst_addr_len,
         NULL, 0, &bytes_sent, &session->dst_io.overlapped))
     {
         if (WSA_IO_PENDING != WSAGetLastError())
         {
-            session_release(session);
-            return -1;
+            goto ERROR_1;
         }
     }
 
     return 0;
+
+ERROR_1:
+    session_release(session);
+    return -1;
 }
 
 // 投递Timeout
@@ -965,72 +971,88 @@ static int post_timeout(pf_tcp_t* pf, pf_session_t* session)
 }
 
 // 投递Recv
-static int post_recv(pf_tcp_t* pf, pf_io_context_t* context, WSABUF* buf, pf_io_type_t type)
+static int post_recv(pf_tcp_t* pf, pf_session_t* session, pf_io_type_t type)
 {
     DWORD flags = 0;
+    WSABUF* buf = NULL;
+    pf_io_context_t* context = NULL;
     SOCKET sock = INVALID_SOCKET;
+    session_addref(session);
 
     if (PF_IO_SRC_READ == type)
     {
-        sock = context->session->src_conn;
+        sock = session->src_conn;
+        context = &session->src_io;
+        buf = &session->src_wsa_buffer;
     }
     else if (PF_IO_DST_READ == type)
     {
-        sock = context->session->dst_conn;
+        sock = session->dst_conn;
+        context = &session->dst_io;
+        buf = &session->dst_wsa_buffer;
     }
     else
     {
-        return -1;
+        goto ERROR_1;
     }
 
     context->operation_type = type;
     memset(&context->overlapped, 0, sizeof(OVERLAPPED));
-
-    session_addref(context->session);
     if (SOCKET_ERROR == WSARecv(sock, buf, 1, NULL, &flags, &context->overlapped, NULL))
     {
         if (WSA_IO_PENDING != WSAGetLastError())
         {
-            session_release(context->session);
-            return -1;
+            goto ERROR_1;
         }
     }
 
     return 0;
+
+ERROR_1:
+    session_release(session);
+    return -1;
 }
 
 // 投递Send
-static int post_send(pf_tcp_t* pf, pf_io_context_t* context, WSABUF* buf, pf_io_type_t type)
+static int post_send(pf_tcp_t* pf, pf_session_t* session, pf_io_type_t type)
 {
+    WSABUF* buf = NULL;
+    pf_io_context_t* context = NULL;
     SOCKET sock = INVALID_SOCKET;
+    session_addref(session);
 
     if (PF_IO_SRC_WRITE == type)
     {
-        sock = context->session->src_conn;
+        sock = session->src_conn;
+        context = &session->dst_io;
+        buf = &session->dst_wsa_buffer;
     }
     else if (PF_IO_DST_WRITE == type)
     {
-        sock = context->session->dst_conn;
+        sock = session->dst_conn;
+        context = &session->src_io;
+        buf = &session->src_wsa_buffer;
     }
     else
     {
-        return -1;
+        goto ERROR_1;
     }
 
     context->operation_type = type;
     memset(&context->overlapped, 0, sizeof(OVERLAPPED));
-
-    session_addref(context->session);
     if (SOCKET_ERROR == WSASend(sock, buf, 1, NULL, 0, &context->overlapped, NULL))
     {
         if (WSA_IO_PENDING != WSAGetLastError())
         {
-            session_release(context->session);
-            return -1;
+            goto ERROR_1;
         }
     }
     
     return 0;
+
+ERROR_1:
+    session_release(session);
+    return -1;
 }
 
 // 创建会话
@@ -1086,28 +1108,6 @@ static pf_session_t* session_create(pf_tcp_t* pf)
     if (INVALID_SOCKET == session->dst_conn)
     {
         goto ERROR_3;
-    }
-
-    // 绑定出站地址
-    if (AF_INET == pf->out_sin_addr.addr.sa_family)
-    {
-        if (SOCKET_ERROR == bind(session->dst_conn,
-            &pf->out_sin_addr.addr, sizeof(pf->out_sin_addr.sin4)))
-        {
-            goto ERROR_4;
-        }
-    }
-    else if (AF_INET6 == pf->out_sin_addr.addr.sa_family)
-    {
-        if (SOCKET_ERROR == bind(session->dst_conn,
-            &pf->out_sin_addr.addr, sizeof(pf->out_sin_addr.sin6)))
-        {
-            goto ERROR_4;
-        }
-    }
-    else
-    {
-        goto ERROR_4;
     }
 
     // 将连接套接字与IOCP关联
