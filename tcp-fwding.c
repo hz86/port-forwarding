@@ -97,14 +97,14 @@ typedef struct pf_tcp_t {
     // 运行状态
     volatile LONG running;        // 是否运行中
     volatile LONG active_threads; // 运行的线程数
-    volatile LONG curr_accepts;   // 当前投递数量
+    volatile LONG curr_accepts;   // 当前接受数量
     volatile LONG post_count;     // 投递数量
 
     // 工作线程
     HANDLE stop_event;            // 停止事件
     HANDLE thread_daemon;         // 守护线程
     HANDLE* thread_workers;       // 工作线程
-    int total_accepts;            // 总投递数量
+    int total_accepts;            // 总接受数量
     int thread_count;             // 工作线程数量
 
     // 配置信息
@@ -257,9 +257,13 @@ pf_tcp_t* pf_tcp_create(pf_config_t* config)
     }
 
     pf->running = 0;
-    pf->post_count = 0;
-    pf->total_accepts = pf->thread_count * 2;
     pf->listen_sock = INVALID_SOCKET;
+    pf->total_accepts = pf->thread_count * 2;
+    if (pf->total_accepts < 32)
+    {
+        pf->total_accepts = 32;
+    }
+
     return pf;
 
 ERROR_6:
@@ -312,6 +316,7 @@ int pf_tcp_start(pf_tcp_t* pf)
         goto ERROR_1;
     }
 
+    // 创建停止事件
     pf->stop_event = CreateEventW(NULL, TRUE, FALSE, NULL);
     if (NULL == pf->stop_event)
     {
@@ -862,7 +867,7 @@ static DWORD WINAPI thread_worker_callback(LPVOID param)
             // 退出信号
             break;
         }
-        else
+        else if (NULL != overlapped)
         {
             // 基础上下文
             InterlockedDecrement(&pf->post_count);
