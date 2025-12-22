@@ -20,19 +20,19 @@ typedef struct table_entry_t {
 
 // 表结构
 typedef struct table_t {
-    volatile LONG lock;             // 自旋锁
-    volatile ssize_t next_alloc_id; // 下一个分配的ID
-    ssize_t free_head_id;           // 空闲链表头ID (-1 表示无回收ID)
-    size_t capacity;                // 数组的容量
-    size_t block_count;             // 当前块数量
-    size_t block_shift;             // 例如 1024 是 2^10，这里存 10
-    size_t block_mask;              // 例如 1023 (0x3FF)
-    size_t block_size;              // 每块可容纳的成员数
-    table_entry_t** array;          // 存放各块指针的数组
+    SRWLOCK lock;          // 读写锁
+    ssize_t next_alloc_id; // 下一个分配的ID
+    ssize_t free_head_id;  // 空闲链表头ID (-1 表示无回收ID)
+    size_t capacity;       // 数组的容量
+    size_t block_count;    // 当前块数量
+    size_t block_shift;    // 例如 1024 是 2^10，这里存 10
+    size_t block_mask;     // 例如 1023 (0x3FF)
+    size_t block_size;     // 每块可容纳的成员数
+    table_entry_t** array; // 存放各块指针的数组
 } table_t;
 
 // 表计算log2
-static inline size_t table_log2(size_t x)
+static inline size_t _log2(size_t x)
 {
     size_t v = 0;
     while (x > 1)
@@ -45,34 +45,32 @@ static inline size_t table_log2(size_t x)
 }
 
 // 表计算是否2的幂
-static inline int table_is_power_of_two(size_t n) {
+static inline int _is_power_of_two(size_t n) {
     return (n > 0) && ((n & (n - 1)) == 0);
 }
 
-// 表加锁
-static inline void table_lock(table_t* table)
+// 表共享加锁
+static inline void table_lock_shared(table_t* table)
 {
-    unsigned int spin_count = 0;
-    while (0 != InterlockedCompareExchange(&table->lock, 1, 0))
-    {
-        if (spin_count++ < 8000)
-        {
-            // 短暂让出CPU
-            YieldProcessor();
-        }
-        else
-        {
-            // 让出CPU
-            spin_count = 0;
-            Sleep(0);
-        }
-    }
+    AcquireSRWLockShared(&table->lock);
 }
 
-// 表解锁
-static inline void table_unlock(table_t* table)
+// 表共享解锁
+static inline void table_unlock_shared(table_t* table)
 {
-    InterlockedExchange(&table->lock, 0);
+    ReleaseSRWLockShared(&table->lock);
+}
+
+// 表独占加锁
+static inline void table_lock_exclusive(table_t* table)
+{
+    AcquireSRWLockExclusive(&table->lock);
+}
+
+// 表独占解锁
+static inline void table_unlock_exclusive(table_t* table)
+{
+    ReleaseSRWLockExclusive(&table->lock);
 }
 
 // 表取成员指针
@@ -95,7 +93,7 @@ table_t* table_create(size_t capacity, size_t block_size)
         goto ERROR_1;
     }
 
-    if (0 == table_is_power_of_two(block_size))
+    if (0 == _is_power_of_two(block_size))
     {
         goto ERROR_1;
     }
@@ -126,11 +124,11 @@ table_t* table_create(size_t capacity, size_t block_size)
         }
     }
 
+    InitializeSRWLock(&table->lock);
     table->block_mask = block_size - 1;
-    table->block_shift = table_log2(block_size);
+    table->block_shift = _log2(block_size);
     table->free_head_id = -1;
     table->next_alloc_id = 0;
-    table->lock = 0;
     return table;
 
 ERROR_3:
@@ -165,7 +163,7 @@ ssize_t table_acquire_id(table_t* table)
     for (;;)
     {
         ssize_t id;
-        table_lock(table);
+        table_lock_exclusive(table);
 
         // 取出回收的ID
         if (table->free_head_id >= 0)
@@ -175,14 +173,14 @@ ssize_t table_acquire_id(table_t* table)
             table->free_head_id = entry->next_free_id;
             entry->is_alloc = 1;
             entry->data = 0;
-            table_unlock(table);
+            table_unlock_exclusive(table);
             return id;
         }
 
         // 是否到达极限值
         if (table->next_alloc_id >= SSIZE_MAX)
         {
-            table_unlock(table);
+            table_unlock_exclusive(table);
             return -1;
         }
 
@@ -194,7 +192,7 @@ ssize_t table_acquire_id(table_t* table)
             table_entry_t* entry = table_get_entry(table, id);
             entry->is_alloc = 1;
             entry->data = 0;
-            table_unlock(table);
+            table_unlock_exclusive(table);
             return id;
         }
 
@@ -203,7 +201,7 @@ ssize_t table_acquire_id(table_t* table)
         {
             // 解锁,降低锁的粒度
             size_t old_block_count = table->block_count;
-            table_unlock(table);
+            table_unlock_exclusive(table);
 
             // 分配新块内存
             table_entry_t* new_block = (table_entry_t*)malloc(table->block_size * sizeof(table_entry_t));
@@ -213,11 +211,11 @@ ssize_t table_acquire_id(table_t* table)
             }
 
             // 加锁
-            table_lock(table);
+            table_lock_exclusive(table);
             if (old_block_count != table->block_count)
             {
                 // 被抢占了，重试
-                table_unlock(table);
+                table_unlock_exclusive(table);
                 free(new_block);
                 continue;
             }
@@ -225,7 +223,7 @@ ssize_t table_acquire_id(table_t* table)
             // 添加
             table->array[block_id] = new_block;
             table->block_count++;
-            table_unlock(table);
+            table_unlock_exclusive(table);
             continue;
         }
 
@@ -233,14 +231,14 @@ ssize_t table_acquire_id(table_t* table)
         size_t new_capacity = table->capacity * 2;
         if (new_capacity < table->capacity)
         {
-            table_unlock(table);
+            table_unlock_exclusive(table);
             return -1;
         }
 
         // 解锁,降低锁的粒度
         size_t old_capacity = table->capacity;
         table_entry_t** old_array = table->array;
-        table_unlock(table);
+        table_unlock_exclusive(table);
 
         // 分配块数组内存
         table_entry_t** new_array = (table_entry_t**)malloc(new_capacity * sizeof(table_entry_t*));
@@ -250,11 +248,11 @@ ssize_t table_acquire_id(table_t* table)
         }
 
         // 加锁
-        table_lock(table);
+        table_lock_exclusive(table);
         if (old_capacity != table->capacity || old_array != table->array)
         {
             // 被抢占了，重试
-            table_unlock(table);
+            table_unlock_exclusive(table);
             free(new_array);
             continue;
         }
@@ -263,7 +261,7 @@ ssize_t table_acquire_id(table_t* table)
         memcpy(new_array, table->array, old_capacity * sizeof(table_entry_t*));
         table->capacity = new_capacity;
         table->array = new_array;
-        table_unlock(table);
+        table_unlock_exclusive(table);
         free(old_array);
         continue;
     }
@@ -272,67 +270,61 @@ ssize_t table_acquire_id(table_t* table)
 // 表删除ID
 int table_free_id(table_t* table, ssize_t id)
 {
-    if (id < 0 || id >= table->next_alloc_id)
-    {
-        return -1;
-    }
-
     int result = -1;
-    table_lock(table);
+    table_lock_exclusive(table);
 
-    table_entry_t* entry = table_get_entry(table, id);
-    if (0 != entry->is_alloc)
+    if (id >= 0 && id < table->next_alloc_id)
     {
-        entry->is_alloc = 0;
-        entry->next_free_id = table->free_head_id;
-        table->free_head_id = id;
-        result = 0;
+        table_entry_t* entry = table_get_entry(table, id);
+        if (0 != entry->is_alloc)
+        {
+            entry->is_alloc = 0;
+            entry->next_free_id = table->free_head_id;
+            table->free_head_id = id;
+            result = 0;
+        }
     }
-    
-    table_unlock(table);
+
+    table_unlock_exclusive(table);
     return result;
 }
 
 // 表设置数据
 int table_set(table_t* table, ssize_t id, uintptr_t data)
 {
-    if (id < 0 || id >= table->next_alloc_id)
-    {
-        return -1;
-    }
-
     int result = -1;
-    table_lock(table);
+    table_lock_exclusive(table);
 
-    table_entry_t* entry = table_get_entry(table, id);
-    if (0 != entry->is_alloc)
+    if (id >= 0 && id < table->next_alloc_id)
     {
-        entry->data = data;
-        result = 0;
+        table_entry_t* entry = table_get_entry(table, id);
+        if (0 != entry->is_alloc)
+        {
+            entry->data = data;
+            result = 0;
+        }
     }
-    
-    table_unlock(table);
+
+    table_unlock_exclusive(table);
     return result;
 }
 
 // 表获取数据
 int table_get(table_t* table, ssize_t id, uintptr_t* data)
 {
-    if (id < 0 || id >= table->next_alloc_id)
-    {
-        return -1;
-    }
-
     int result = -1;
-    table_lock(table);
+    table_lock_shared(table);
 
-    table_entry_t* entry = table_get_entry(table, id);
-    if (0 != entry->is_alloc)
+    if (id >= 0 && id < table->next_alloc_id)
     {
-        *data = entry->data;
-        result = 0;
+        table_entry_t* entry = table_get_entry(table, id);
+        if (0 != entry->is_alloc)
+        {
+            *data = entry->data;
+            result = 0;
+        }
     }
-    
-    table_unlock(table);
+
+    table_unlock_shared(table);
     return result;
 }

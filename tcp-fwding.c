@@ -1,43 +1,52 @@
 ﻿/*
  简短转发流程：
 
- 1. 初始化（`pf_tcp_create`）
-    - 初始化 Winsock、解析 IP、创建 IOCP、定时器队列和会话表。
+ 1. 初始化（pf_tcp_create）
+    - 初始化 Winsock、解析 IP 地址、创建 IOCP、定时器队列。
+    - 创建会话池和会话表以管理连接资源。
 
- 2. 启动（`pf_tcp_start`）
-    - 创建监听 socket，获取 `AcceptEx`/`ConnectEx` 等扩展函数，绑定并关联到 IOCP，
-      创建工作线程并通过 `post_accept` 向 IOCP 投递初始事件。
+ 2. 启动（pf_tcp_start）
+    - 创建监听 Socket，动态加载 AcceptEx/ConnectEx/DisconnectEx 等扩展函数。
+    - 绑定监听端口并关联 IOCP，启动工作线程池和守护线程。
 
- 3. 接受连接
-    - 调用 `post_accept`，为每个新会话创建 `pf_session_t` 并调用 `AcceptEx`。
+ 3. 接受连接（Daemon Thread / post_accept）
+    - 守护线程监控 active_accepts 数量，不足时循环调用 post_accept。
+    - post_accept 从池中获取会话，通过 AcceptEx 投递异步接受请求。
 
- 4. Accept 完成（`handle_accept`）
-    - 调用 `SO_UPDATE_ACCEPT_CONTEXT` 完成 accept，上报客户端地址（`get_accept_sockaddrs`）；
-      如配置超时则 `post_timeout`，然后调用 `post_connect` 对目标发起 `ConnectEx`。
+ 4. Accept 完成（handle_accept）
+    - 调用 SO_UPDATE_ACCEPT_CONTEXT 更新上下文，解析客户端地址。
+    - 如配置超时则 post_timeout，然后调用 post_connect 对目标发起 ConnectEx。
 
- 5. Connect 完成（`handle_connect`）
-    - 取消超时（`session_cancel_timeout`），调用 `SO_UPDATE_CONNECT_CONTEXT`，获取本地/远端地址；
-      启动双方异步接收（`post_recv`）进入数据转发阶段。
+ 5. Connect 完成（handle_connect）
+    - 取消连接超时计时器（session_cancel_timeout）。
+    - 调用 SO_UPDATE_CONNECT_CONTEXT，获取目标两端地址。
+    - 同时向源端和目标端投递异步接收请求（post_recv），进入双向转发状态。
 
  6. 数据转发（读/写循环）
     - 链式数据流：
       - 源读 -> 目标写 -> 源读
       - 目标读 -> 源写 -> 目标读
-    - 读完成（`handle_*_read`）：若 bytes==0 标记半关闭，否则把数据 `post_send` 到对端。
-    - 写完成（`handle_*_write`）：处理部分发送（调整 `WSABUF`）或发送完毕后重新 `post_recv`。
-    - 使用引用计数和 `session_io_release` 安全地做半关闭或强制关闭。
+    - 读完成（handle_*_read）：
+      - 若 bytes > 0：将数据投递给对端发送（post_send）。
+      - 若 bytes == 0：标记半关闭，投递 DisconnectEx（post_disconnect）以复用 Socket。
+    - 写完成（handle_*_write）：
+      - 若发送未发完：调整缓冲区偏移继续发送。
+      - 若发送完毕：重新向数据来源端投递接收请求（post_recv）。
+    - Disconnect 完成：根据成功与否请求关闭会话，准备回收。
 
- 7. 超时与关闭
-    - 定时器回调 `handle_timer_callback` 通过 IOCP 通知（区分 bytes=1 到期和 bytes=0 取消）；
-      超时或错误时调用 `session_request_close`，最终由 `session_io_release`/`session_release` 回收资源。
+ 7. 超时与关闭资源管理
+    - 定时器回调 handle_timer_callback 通过 IOCP 通知（区分 bytes=1 到期和 bytes=0 取消）
+      超时或错误时调用 session_request_close，最终由 session_io_unlock / session_release 回收资源。
 
- 8. 停止与清理（`pf_tcp_stop` / 线程退出）
-    - 停止时向 IOCP 投递 `completion_key == 0` 让工作线程退出；最后一个线程遍历 `session_table` 强制释放残留会话。
+ 8. 停止与清理（pf_tcp_stop / 线程退出）
+    - 停止守护线程，向 IOCP 投递退出信号（completion_key == 0）。
+    - 工作线程逐个退出，最后一个退出的工作线程负责全局清理：
+      - 关闭监听 Socket、遍历会话表强制关闭所有残留会话、排空 IOCP 队列并释放内存。
 
- 额外说明：
- - IOCP `completion_key` 约定：0 = 退出，1 = 初始化/要求投递 Accept，其他 = 指向 `pf_tcp_t`（实际事件由 `OVERLAPPED` 的 `operation_type` 区分）。
- - 每个处理函数在开始时调用 `session_io_addref`，结束时调用 `session_io_release`，保证在最后一个 IO 完成时执行真正的关闭/半关闭逻辑。
- - 关键异步接口：`AcceptEx`、`ConnectEx`、`WSARecv`、`WSASend`、IOCP、TimerQueue。
+ 关键技术点：
+ - IOCP 模型：全异步事件驱动（Accept/Connect/Read/Write/Disconnect/Timeout）。
+ - 内存管理：会话池（Pool）与会话表（Table）结合，减少内存分配开销。
+ - 锁机制：使用 Interlocked 原子操作与自旋锁（session_io_lock/unlock）保证多线程安全。
 */
 
 #define _CRT_SECURE_NO_WARNINGS
@@ -52,6 +61,7 @@
 #include <mswsock.h>
 #include <windows.h>
 
+#include "pool.h"
 #include "table.h"
 #include "fwding.h"
 
@@ -64,17 +74,22 @@ typedef enum {
     PF_IO_CONNECT = 2,
     PF_IO_SRC_READ = 3,
     PF_IO_SRC_WRITE = 4,
-    PF_IO_DST_READ = 5,
-    PF_IO_DST_WRITE = 6,
-    PF_IO_TIMEOUT = 7,
+    PF_IO_SRC_DISCONNECT = 5,
+    PF_IO_DST_READ = 6,
+    PF_IO_DST_WRITE = 7,
+    PF_IO_DST_DISCONNECT = 8,
+    PF_IO_TIMEOUT = 9,
 } pf_io_type_t;
 
 // 会话关闭类型
 typedef enum {
     PF_SESSION_NONE = 0,
     PF_SESSION_CLOSE = 1,
-    PF_SESSION_SRC_CLOSE = 2,
-    PF_SESSION_DST_CLOSE = 4,
+    PF_SESSION_CLOSE_END = 2,
+    PF_SESSION_SRC_CLOSE = 4,
+    PF_SESSION_SRC_CLOSE_END = 8,
+    PF_SESSION_DST_CLOSE = 16,
+    PF_SESSION_DST_CLOSE_END = 32,
 } pf_session_close_flag_t;
 
 // 会话超时类型
@@ -97,7 +112,7 @@ typedef struct pf_tcp_t {
     // 运行状态
     volatile LONG running;        // 是否运行中
     volatile LONG active_threads; // 运行的线程数
-    volatile LONG curr_accepts;   // 当前接受数量
+    volatile LONG active_accepts; // 运作的接受数量
     volatile LONG post_count;     // 投递数量
 
     // 工作线程
@@ -116,6 +131,7 @@ typedef struct pf_tcp_t {
     // 套接字相关
     HANDLE iocp;                    // IOCP句柄
     HANDLE timer_queue;             // 定时器队列
+    pool_t* session_pool;           // 会话池
     table_t* session_table;         // 会话表
     SOCKET listen_sock;             // 监听套接字
     LPFN_ACCEPTEX acceptex;         // 扩展接口
@@ -135,11 +151,11 @@ typedef struct pf_io_context_t {
 // 会话上下文
 typedef struct pf_session_t {
     volatile LONG ref;            // 引用计数
-    volatile LONG io_ref;         // IO引用计数
+    volatile LONG lock;           // 会话自旋锁
     volatile LONG close_flags;    // 关闭标志
     volatile LONG timeout_status; // 超时状态
 
-    ssize_t session_id;           // 唯一ID
+    ssize_t session_id;           // 唯一会话ID
     HANDLE timeout_timer;         // 定时器句柄
     pf_tcp_t* pf;                 // 父指针
 
@@ -169,17 +185,20 @@ typedef struct pf_session_t {
 static int post_accept(pf_tcp_t* pf);
 static int post_connect(pf_tcp_t* pf, pf_session_t* session);
 static int post_timeout(pf_tcp_t* pf, pf_session_t* session);
+static int post_disconnect(pf_tcp_t* pf, pf_session_t* session, pf_io_type_t type);
 static int post_recv(pf_tcp_t* pf, pf_session_t* session, pf_io_type_t type);
 static int post_send(pf_tcp_t* pf, pf_session_t* session, pf_io_type_t type, int bytes_transferred, int offset);
 static int parse_ip_addr(const char* ip, unsigned short port, pf_sockaddr_t* addr);
+static int get_sockaddr_len(pf_sockaddr_t* sockaddr);
+static pool_t* session_pool_create(pf_tcp_t* pf, size_t max_size);
+static void session_pool_close(pool_t* pool);
 static pf_session_t* session_create(pf_tcp_t* pf);
-static void session_addref(pf_session_t* session);
-static void session_io_addref(pf_session_t* session);
-static void session_io_release(pf_session_t* session);
+static void session_ref(pf_session_t* session);
+static void session_io_lock(pf_session_t* session);
+static void session_io_unlock(pf_session_t* session);
 static void session_request_close(pf_session_t* session, pf_session_close_flag_t flag);
 static void session_cancel_timeout(pf_session_t* session);
 static void session_release(pf_session_t* session);
-static void session_free(pf_session_t* session);
 static DWORD WINAPI thread_daemon_callback(LPVOID param);
 static DWORD WINAPI thread_worker_callback(LPVOID param);
 
@@ -244,16 +263,22 @@ pf_tcp_t* pf_tcp_create(pf_config_t* config)
         goto ERROR_4;
     }
 
+    pf->session_pool = session_pool_create(pf, 4096);
+    if (NULL == pf->session_pool)
+    {
+        goto ERROR_5;
+    }
+
     pf->session_table = table_create(16, 8192);
     if (NULL == pf->session_table)
     {
-        goto ERROR_5;
+        goto ERROR_6;
     }
 
     pf->iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
     if (NULL == pf->iocp)
     {
-        goto ERROR_6;
+        goto ERROR_7;
     }
 
     pf->running = 0;
@@ -266,8 +291,10 @@ pf_tcp_t* pf_tcp_create(pf_config_t* config)
 
     return pf;
 
-ERROR_6:
+ERROR_7:
     table_close(pf->session_table);
+ERROR_6:
+    session_pool_close(pf->session_pool);
 ERROR_5:
     (void)DeleteTimerQueueEx(pf->timer_queue, INVALID_HANDLE_VALUE);
 ERROR_4:
@@ -295,6 +322,7 @@ void pf_tcp_destroy(pf_tcp_t* pf)
 
     CloseHandle(pf->iocp);
     table_close(pf->session_table);
+    session_pool_close(pf->session_pool);
     (void)DeleteTimerQueueEx(pf->timer_queue, INVALID_HANDLE_VALUE);
     free(pf->thread_workers);
     free(pf);
@@ -360,25 +388,8 @@ int pf_tcp_start(pf_tcp_t* pf)
     }
 
     // 绑定监听套接字
-    if (AF_INET == pf->src_addr.addr.sa_family)
-    {
-        // IPV4
-        if (SOCKET_ERROR == bind(pf->listen_sock,
-            &pf->src_addr.addr, sizeof(pf->src_addr.sin4)))
-        {
-            goto ERROR_3;
-        }
-    }
-    else if (AF_INET6 == pf->src_addr.addr.sa_family)
-    {
-        // IPV6
-        if (SOCKET_ERROR == bind(pf->listen_sock,
-            &pf->src_addr.addr, sizeof(pf->src_addr.sin6)))
-        {
-            goto ERROR_3;
-        }
-    }
-    else
+    if (SOCKET_ERROR == bind(pf->listen_sock,
+        &pf->src_addr.addr, get_sockaddr_len(&pf->src_addr)))
     {
         goto ERROR_3;
     }
@@ -398,7 +409,7 @@ int pf_tcp_start(pf_tcp_t* pf)
     // 准备启动
     pf->running = 1;
     pf->post_count = 0;
-    pf->curr_accepts = 0;
+    pf->active_accepts = 0;
     pf->active_threads = 0;
 
     // 创建线程
@@ -412,9 +423,6 @@ int pf_tcp_start(pf_tcp_t* pf)
             // 错误处理
             InterlockedExchange(&pf->running, 0);
             InterlockedDecrement(&pf->active_threads);
-
-            closesocket(pf->listen_sock);
-            pf->listen_sock = INVALID_SOCKET;
 
             for (int j = 0; j < i; j++)
             {
@@ -430,8 +438,6 @@ int pf_tcp_start(pf_tcp_t* pf)
 
             CloseHandle(pf->stop_event);
             pf->stop_event = NULL;
-
-            pf->curr_accepts = 0;
             goto ERROR_1;
         }
     }
@@ -474,12 +480,6 @@ int pf_tcp_stop(pf_tcp_t* pf)
         CloseHandle(pf->thread_daemon);
     }
 
-    if (INVALID_SOCKET != pf->listen_sock)
-    {
-        closesocket(pf->listen_sock);
-        pf->listen_sock = INVALID_SOCKET;
-    }
-
     for (int i = 0; i < pf->thread_count; i++)
     {
         PostQueuedCompletionStatus(pf->iocp, 0, 0, NULL);
@@ -497,7 +497,6 @@ int pf_tcp_stop(pf_tcp_t* pf)
 
     CloseHandle(pf->stop_event);
     pf->stop_event = NULL;
-    pf->curr_accepts = 0;
     return 0;
 }
 
@@ -505,18 +504,15 @@ int pf_tcp_stop(pf_tcp_t* pf)
 static void handle_accept(pf_tcp_t* pf, pf_io_context_t* context, int is_success)
 {
     // 继续投递
-    if (0 != InterlockedCompareExchange(&pf->running, 0, 0))
+    if (0 == InterlockedCompareExchange(&pf->running, 0, 0) || -1 == post_accept(pf))
     {
-        if (-1 == post_accept(pf))
-        {
-            InterlockedDecrement(&pf->curr_accepts);
-        }
+        InterlockedDecrement(&pf->active_accepts);
     }
 
     // 处理事件
     int local_addr_len, remote_addr_len;
     pf_session_t* session = context->session;
-    session_io_addref(session);
+    session_io_lock(session);
 
     // 出错
     if (0 == is_success)
@@ -559,9 +555,8 @@ ERROR_2:
     }
 ERROR_1:
     session_request_close(session, PF_SESSION_CLOSE);
-
 RESULT:
-    session_io_release(session);
+    session_io_unlock(session);
     session_release(session);
 }
 
@@ -570,7 +565,7 @@ static void handle_connect(pf_tcp_t* pf, pf_io_context_t* context, int is_succes
 {
     int addr_buffer_len;
     pf_session_t* session = context->session;
-    session_io_addref(session);
+    session_io_lock(session);
 
     // 取消连接超时计时器
     if (pf->config.timeout_ms > 0)
@@ -623,9 +618,8 @@ static void handle_connect(pf_tcp_t* pf, pf_io_context_t* context, int is_succes
 
 ERROR_1:
     session_request_close(session, PF_SESSION_CLOSE);
-
 RESULT:
-    session_io_release(session);
+    session_io_unlock(session);
     session_release(session);
 }
 
@@ -634,7 +628,7 @@ static void handle_src_read(pf_tcp_t* pf, pf_io_context_t* context, int is_succe
 {
     // 会话指针
     pf_session_t* session = context->session;
-    session_io_addref(session);
+    session_io_lock(session);
 
     // 接收出错
     if (0 == is_success)
@@ -646,6 +640,11 @@ static void handle_src_read(pf_tcp_t* pf, pf_io_context_t* context, int is_succe
     if (0 == bytes_transferred)
     {
         session_request_close(session, PF_SESSION_SRC_CLOSE);
+        if (-1 == post_disconnect(pf, session, PF_IO_SRC_DISCONNECT))
+        {
+            goto ERROR_1;
+        }
+
         goto RESULT;
     }
 
@@ -659,9 +658,8 @@ static void handle_src_read(pf_tcp_t* pf, pf_io_context_t* context, int is_succe
 
 ERROR_1:
     session_request_close(session, PF_SESSION_CLOSE);
-
 RESULT:
-    session_io_release(session);
+    session_io_unlock(session);
     session_release(session);
 }
 
@@ -670,7 +668,7 @@ static void handle_dst_read(pf_tcp_t* pf, pf_io_context_t* context, int is_succe
 {
     // 会话指针
     pf_session_t* session = context->session;
-    session_io_addref(session);
+    session_io_lock(session);
 
     // 接收出错
     if (0 == is_success)
@@ -682,6 +680,11 @@ static void handle_dst_read(pf_tcp_t* pf, pf_io_context_t* context, int is_succe
     if (0 == bytes_transferred)
     {
         session_request_close(session, PF_SESSION_DST_CLOSE);
+        if (-1 == post_disconnect(pf, session, PF_IO_DST_DISCONNECT))
+        {
+            goto ERROR_1;
+        }
+
         goto RESULT;
     }
 
@@ -695,9 +698,8 @@ static void handle_dst_read(pf_tcp_t* pf, pf_io_context_t* context, int is_succe
 
 ERROR_1:
     session_request_close(session, PF_SESSION_CLOSE);
-
 RESULT:
-    session_io_release(session);
+    session_io_unlock(session);
     session_release(session);
 }
 
@@ -705,7 +707,7 @@ RESULT:
 static void handle_src_write(pf_tcp_t* pf, pf_io_context_t* context, int is_success, int bytes_transferred)
 {
     pf_session_t* session = context->session;
-    session_io_addref(session);
+    session_io_lock(session);
 
     if (0 == is_success)
     {
@@ -733,9 +735,8 @@ static void handle_src_write(pf_tcp_t* pf, pf_io_context_t* context, int is_succ
 
 ERROR_1:
     session_request_close(session, PF_SESSION_CLOSE);
-
 RESULT:
-    session_io_release(session);
+    session_io_unlock(session);
     session_release(session);
 }
 
@@ -743,7 +744,7 @@ RESULT:
 static void handle_dst_write(pf_tcp_t* pf, pf_io_context_t* context, int is_success, int bytes_transferred)
 {
     pf_session_t* session = context->session;
-    session_io_addref(session);
+    session_io_lock(session);
 
     if (0 == is_success)
     {
@@ -771,9 +772,38 @@ static void handle_dst_write(pf_tcp_t* pf, pf_io_context_t* context, int is_succ
 
 ERROR_1:
     session_request_close(session, PF_SESSION_CLOSE);
-
 RESULT:
-    session_io_release(session);
+    session_io_unlock(session);
+    session_release(session);
+}
+
+// 源套接字重用
+static void handle_src_disconnect(pf_tcp_t* pf, pf_io_context_t* context, int is_success, int bytes_transferred)
+{
+    pf_session_t* session = context->session;
+    session_io_lock(session);
+
+    if (0 == is_success)
+    {
+        session_request_close(session, PF_SESSION_CLOSE);
+    }
+
+    session_io_unlock(session);
+    session_release(session);
+}
+
+// 目标套接字重用
+static void handle_dst_disconnect(pf_tcp_t* pf, pf_io_context_t* context, int is_success, int bytes_transferred)
+{
+    pf_session_t* session = context->session;
+    session_io_lock(session);
+
+    if (0 == is_success)
+    {
+        session_request_close(session, PF_SESSION_CLOSE);
+    }
+
+    session_io_unlock(session);
     session_release(session);
 }
 
@@ -781,14 +811,14 @@ RESULT:
 static void handle_timeout(pf_tcp_t* pf, pf_io_context_t* context, int is_success, int bytes_transferred)
 {
     pf_session_t* session = context->session;
-    session_io_addref(session);
+    session_io_lock(session);
 
     if (0 != is_success && 0 != bytes_transferred)
     {
         session_request_close(session, PF_SESSION_CLOSE);
     }
 
-    session_io_release(session);
+    session_io_unlock(session);
     session_release(session);
 }
 
@@ -796,6 +826,7 @@ static void handle_timeout(pf_tcp_t* pf, pf_io_context_t* context, int is_succes
 static VOID CALLBACK handle_timer_callback(PVOID parameter, BOOLEAN timer_or_waitfired)
 {
     pf_session_t* session = (pf_session_t*)parameter;
+    (void)ChangeTimerQueueTimer(session->pf->timer_queue, session->timeout_timer, INFINITE, INFINITE);
     if (PF_SESSION_TIMEOUT_START == InterlockedCompareExchange(&session->timeout_status, PF_SESSION_TIMEOUT_COMPLETE, PF_SESSION_TIMEOUT_START))
     {
         PostQueuedCompletionStatus(session->pf->iocp, 1, (ULONG_PTR)session->pf, &session->tmo_io.overlapped);
@@ -817,21 +848,24 @@ static DWORD WINAPI thread_daemon_callback(LPVOID param)
 
         for (;;)
         {
+            // 退出信号
+            if (0 == InterlockedCompareExchange(&pf->running, 0, 0))
+            {
+                break;
+            }
+
             // 投递数是否相等
             if (pf->total_accepts == InterlockedCompareExchange(
-                &pf->curr_accepts, pf->total_accepts, pf->total_accepts))
+                &pf->active_accepts, pf->total_accepts, pf->total_accepts))
             {
                 break;
             }
 
             // 补充投递
-            if (-1 != post_accept(pf))
+            InterlockedIncrement(&pf->active_accepts);
+            if (-1 == post_accept(pf))
             {
-                // 投递成功
-                InterlockedIncrement(&pf->curr_accepts);
-            }
-            else
-            {
+                InterlockedDecrement(&pf->active_accepts);
                 break;
             }
         }
@@ -902,6 +936,16 @@ static DWORD WINAPI thread_worker_callback(LPVOID param)
                 // 发送数据
                 handle_dst_write(pf, context, is_success, (int)bytes_transferred);
             }
+            else if (PF_IO_SRC_DISCONNECT == context->operation_type)
+            {
+                // 重用套接字
+                handle_src_disconnect(pf, context, is_success, (int)bytes_transferred);
+            }
+            else if (PF_IO_DST_DISCONNECT == context->operation_type)
+            {
+                // 重用套接字
+                handle_dst_disconnect(pf, context, is_success, (int)bytes_transferred);
+            }
             else if (PF_IO_TIMEOUT == context->operation_type)
             {
                 // 超时处理
@@ -913,6 +957,13 @@ static DWORD WINAPI thread_worker_callback(LPVOID param)
     // 最后一个线程负责清理工作
     if (0 == InterlockedDecrement(&pf->active_threads))
     {
+        // 关闭监听套接字
+        if (INVALID_SOCKET != pf->listen_sock)
+        {
+            closesocket(pf->listen_sock);
+            pf->listen_sock = INVALID_SOCKET;
+        }
+
         // 关闭所有会话
         pf_session_t* curr_session = NULL;
         ssize_t count = table_max_id(pf->session_table) + 1;
@@ -920,9 +971,9 @@ static DWORD WINAPI thread_worker_callback(LPVOID param)
         {
             if (-1 != table_get(pf->session_table, i, (uintptr_t*)&curr_session))
             {
-                session_io_addref(curr_session);
+                session_io_lock(curr_session);
                 session_request_close(curr_session, PF_SESSION_CLOSE);
-                session_io_release(curr_session);
+                session_io_unlock(curr_session);
             }
         }
 
@@ -937,7 +988,7 @@ static DWORD WINAPI thread_worker_callback(LPVOID param)
                 &bytes_transferred,
                 &completion_key,
                 &overlapped,
-                INFINITE
+                0
             );
 
             if (NULL != overlapped)
@@ -945,6 +996,10 @@ static DWORD WINAPI thread_worker_callback(LPVOID param)
                 InterlockedDecrement(&pf->post_count);
                 pf_io_context_t* context = (pf_io_context_t*)overlapped;
                 session_release(context->session);
+            }
+            else
+            {
+                break;
             }
         }
     }
@@ -974,18 +1029,37 @@ static int parse_ip_addr(const char* ip, unsigned short port, pf_sockaddr_t* add
     return -1;
 }
 
+// 获取地址长度
+static int get_sockaddr_len(pf_sockaddr_t* sockaddr)
+{
+    if (AF_INET == sockaddr->addr.sa_family)
+    {
+        return sizeof(sockaddr->sin4);
+    }
+    else if (AF_INET6 == sockaddr->addr.sa_family)
+    {
+        return sizeof(sockaddr->sin6);
+    }
+    else
+    {
+        return 0;
+    }
+}
+
 // 投递Accept
 static int post_accept(pf_tcp_t* pf)
 {
-    DWORD bytes_received;
+    DWORD bytes_received = 0;
     pf_session_t* session = session_create(pf);
     if (NULL == session)
     {
         goto ERROR_1;
     }
 
-    InterlockedIncrement(&pf->post_count);
     session->src_io.operation_type = PF_IO_ACCEPT;
+    memset(&session->src_io.overlapped, 0, sizeof(OVERLAPPED));
+
+    InterlockedIncrement(&pf->post_count);
     if (FALSE == pf->acceptex(pf->listen_sock, session->src_sock,
         session->src_addr_buffer, 0, sizeof(pf_sockaddr_t) + 16, sizeof(pf_sockaddr_t) + 16,
         &bytes_received, &session->src_io.overlapped))
@@ -1008,9 +1082,9 @@ ERROR_1:
 // 投递Connect
 static int post_connect(pf_tcp_t* pf, pf_session_t* session)
 {
-    DWORD bytes_sent;
-    DWORD dst_addr_len, out_addr_len;
-    session_addref(session);
+    DWORD bytes_sent = 0;
+    DWORD dst_addr_len = 0;
+    session_ref(session);
 
     if (AF_INET == pf->dst_addr.addr.sa_family)
     {
@@ -1025,27 +1099,10 @@ static int post_connect(pf_tcp_t* pf, pf_session_t* session)
         goto ERROR_1;
     }
 
-    if (AF_INET == pf->out_addr.addr.sa_family)
-    {
-        out_addr_len = sizeof(pf->out_addr.sin4);
-    }
-    else if (AF_INET6 == pf->out_addr.addr.sa_family)
-    {
-        out_addr_len = sizeof(pf->out_addr.sin6);
-    }
-    else
-    {
-        goto ERROR_1;
-    }
-
-    if (SOCKET_ERROR == bind(session->dst_sock,
-        &pf->out_addr.addr, out_addr_len))
-    {
-        goto ERROR_1;
-    }
+    session->dst_io.operation_type = PF_IO_CONNECT;
+    memset(&session->dst_io.overlapped, 0, sizeof(OVERLAPPED));
 
     InterlockedIncrement(&pf->post_count);
-    session->dst_io.operation_type = PF_IO_CONNECT;
     if (FALSE == pf->connectex(session->dst_sock, &pf->dst_addr.addr, dst_addr_len,
         NULL, 0, &bytes_sent, &session->dst_io.overlapped))
     {
@@ -1066,16 +1123,18 @@ ERROR_1:
 // 投递Timeout
 static int post_timeout(pf_tcp_t* pf, pf_session_t* session)
 {
-    session_addref(session);
+    session_ref(session);
     if (PF_SESSION_TIMEOUT_NONE != InterlockedCompareExchange(&session->timeout_status, PF_SESSION_TIMEOUT_START, PF_SESSION_TIMEOUT_NONE))
     {
         session_release(session);
         return -1;
     }
 
-    InterlockedIncrement(&pf->post_count);
     session->tmo_io.operation_type = PF_IO_TIMEOUT;
-    if (FALSE == ChangeTimerQueueTimer(pf->timer_queue, session->timeout_timer, pf->config.timeout_ms, 0))
+    memset(&session->tmo_io.overlapped, 0, sizeof(OVERLAPPED));
+
+    InterlockedIncrement(&pf->post_count);
+    if (FALSE == ChangeTimerQueueTimer(pf->timer_queue, session->timeout_timer, pf->config.timeout_ms, INFINITE))
     {
         InterlockedExchange(&session->timeout_status, PF_SESSION_TIMEOUT_NONE);
         InterlockedDecrement(&pf->post_count);
@@ -1093,7 +1152,7 @@ static int post_recv(pf_tcp_t* pf, pf_session_t* session, pf_io_type_t type)
     WSABUF* buffer = NULL;
     pf_io_context_t* context = NULL;
     SOCKET sock = INVALID_SOCKET;
-    session_addref(session);
+    session_ref(session);
 
     if (PF_IO_SRC_READ == type)
     {
@@ -1117,8 +1176,9 @@ static int post_recv(pf_tcp_t* pf, pf_session_t* session, pf_io_type_t type)
     }
 
     context->operation_type = type;
-    InterlockedIncrement(&pf->post_count);
     memset(&context->overlapped, 0, sizeof(OVERLAPPED));
+
+    InterlockedIncrement(&pf->post_count);
     if (SOCKET_ERROR == WSARecv(sock, buffer, 1, NULL, &flags, &context->overlapped, NULL))
     {
         if (WSA_IO_PENDING != WSAGetLastError())
@@ -1141,7 +1201,7 @@ static int post_send(pf_tcp_t* pf, pf_session_t* session, pf_io_type_t type, int
     WSABUF* buffer = NULL;
     pf_io_context_t* context = NULL;
     SOCKET sock = INVALID_SOCKET;
-    session_addref(session);
+    session_ref(session);
 
     if (PF_IO_SRC_WRITE == type)
     {
@@ -1151,7 +1211,7 @@ static int post_send(pf_tcp_t* pf, pf_session_t* session, pf_io_type_t type, int
         if (offset > 0)
         {
             buffer->buf += offset;
-            buffer->len -= bytes_transferred;
+            buffer->len -= offset;
         }
         else
         {
@@ -1167,7 +1227,7 @@ static int post_send(pf_tcp_t* pf, pf_session_t* session, pf_io_type_t type, int
         if (offset > 0)
         {
             buffer->buf += offset;
-            buffer->len -= bytes_transferred;
+            buffer->len -= offset;
         }
         else
         {
@@ -1181,8 +1241,9 @@ static int post_send(pf_tcp_t* pf, pf_session_t* session, pf_io_type_t type, int
     }
 
     context->operation_type = type;
-    InterlockedIncrement(&pf->post_count);
     memset(&context->overlapped, 0, sizeof(OVERLAPPED));
+
+    InterlockedIncrement(&pf->post_count);
     if (SOCKET_ERROR == WSASend(sock, buffer, 1, NULL, 0, &context->overlapped, NULL))
     {
         if (WSA_IO_PENDING != WSAGetLastError())
@@ -1199,10 +1260,53 @@ ERROR_1:
     return -1;
 }
 
-// 创建会话
-static pf_session_t* session_create(pf_tcp_t* pf)
+// 投递Disconnect
+static int post_disconnect(pf_tcp_t* pf, pf_session_t* session, pf_io_type_t type)
 {
-    pf_session_t* session = (pf_session_t*)malloc(sizeof(pf_session_t));
+    SOCKET sock = INVALID_SOCKET;
+    pf_io_context_t* context = NULL;
+    session_ref(session);
+
+    if (PF_IO_SRC_DISCONNECT == type)
+    {
+        sock = session->src_sock;
+        context = &session->src_io;
+    }
+    else if (PF_IO_DST_DISCONNECT == type)
+    {
+        sock = session->dst_sock;
+        context = &session->dst_io;
+    }
+    else
+    {
+        goto ERROR_1;
+    }
+
+    context->operation_type = type;
+    memset(&context->overlapped, 0, sizeof(OVERLAPPED));
+
+    InterlockedIncrement(&pf->post_count);
+    if (SOCKET_ERROR == pf->disconnectex(sock, &context->overlapped, TF_REUSE_SOCKET, 0))
+    {
+        if (WSA_IO_PENDING != WSAGetLastError())
+        {
+            InterlockedDecrement(&pf->post_count);
+            goto ERROR_1;
+        }
+    }
+
+    return 0;
+
+ERROR_1:
+    session_release(session);
+    return -1;
+}
+
+// 会话池空时触发申请操作
+static void* session_pool_alloc_t(pool_t* pool, void* user_data)
+{
+    pf_tcp_t* pf = (pf_tcp_t*)user_data;
+    pf_session_t* session = (pf_session_t*)pool_mem_alloc(pool, sizeof(pf_session_t));
     if (NULL == session)
     {
         goto ERROR_1;
@@ -1210,7 +1314,8 @@ static pf_session_t* session_create(pf_tcp_t* pf)
 
     // 初始化
     session->ref = 1;
-    session->io_ref = 0;
+    session->lock = 0;
+    session->session_id = -1;
     session->close_flags = PF_SESSION_NONE;
     session->timeout_status = PF_SESSION_TIMEOUT_NONE;
     session->pf = pf;
@@ -1254,114 +1359,287 @@ static pf_session_t* session_create(pf_tcp_t* pf)
         goto ERROR_3;
     }
 
+    // 目标套接字绑定出站地址
+    if (SOCKET_ERROR == bind(session->dst_sock,
+        &pf->out_addr.addr, get_sockaddr_len(&pf->out_addr)))
+    {
+        goto ERROR_4;
+    }
+
     // 将连接套接字与IOCP关联
     if (NULL == CreateIoCompletionPort((HANDLE)session->dst_sock, pf->iocp, (ULONG_PTR)pf, 0))
     {
         goto ERROR_4;
     }
 
-    // 超时定时器
+    // 创建超时定时器
     if (FALSE == CreateTimerQueueTimer(&session->timeout_timer, pf->timer_queue,
-        handle_timer_callback, session, INFINITE, 0, WT_EXECUTEONLYONCE))
+        handle_timer_callback, session, INFINITE, INFINITE, 0))
     {
         goto ERROR_4;
     }
 
-    // 获取唯一ID
-    session->session_id = table_acquire_id(pf->session_table);
-    if (-1 == session->session_id)
-    {
-        goto ERROR_5;
-    }
-
-    // 写入会话指针
-    if (-1 == table_set(pf->session_table, session->session_id, (uintptr_t)session))
-    {
-        goto ERROR_6;
-    }
-
     return session;
 
-ERROR_6:
-    table_free_id(pf->session_table, session->session_id);
-ERROR_5:
-    (void)DeleteTimerQueueTimer(session->pf->timer_queue,
-        session->timeout_timer, INVALID_HANDLE_VALUE);
 ERROR_4:
     closesocket(session->dst_sock);
 ERROR_3:
     closesocket(session->src_sock);
 ERROR_2:
-    free(session);
+    pool_mem_free(pool, session);
 ERROR_1:
     return NULL;
 }
 
+// 会话池回收时触发
+static void* session_pool_reset(pool_t* pool, void* user_data, void* mem)
+{
+    pf_tcp_t* pf = (pf_tcp_t*)user_data;
+    pf_session_t* session = (pf_session_t*)mem;
+
+    // 重新初始化
+    session->ref = 1;
+    session->lock = 0;
+    session->session_id = -1;
+    session->close_flags = PF_SESSION_NONE;
+    session->timeout_status = PF_SESSION_TIMEOUT_NONE;
+
+    session->src_local_addr = NULL;
+    session->src_remote_addr = NULL;
+    session->src_wsa_buffer.buf = NULL;
+    session->src_wsa_buffer.len = 0;
+
+    session->dst_local_addr = NULL;
+    session->dst_remote_addr = NULL;
+    session->dst_wsa_buffer.buf = NULL;
+    session->dst_wsa_buffer.len = 0;
+
+    memset(&session->src_io, 0, sizeof(pf_io_context_t));
+    memset(&session->dst_io, 0, sizeof(pf_io_context_t));
+    memset(&session->tmo_io, 0, sizeof(pf_io_context_t));
+    session->src_io.session = session;
+    session->dst_io.session = session;
+    session->tmo_io.session = session;
+
+    // 是否需要创建源套接字
+    if (INVALID_SOCKET == session->src_sock)
+    {
+        // 创建源套接字
+        session->src_sock = WSASocketW(pf->src_addr.addr.sa_family,
+            SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
+        if (INVALID_SOCKET == session->src_sock)
+        {
+            return NULL;
+        }
+
+        // 将源套接字与IOCP关联
+        if (NULL == CreateIoCompletionPort((HANDLE)session->src_sock, pf->iocp, (ULONG_PTR)pf, 0))
+        {
+            closesocket(session->src_sock);
+            session->src_sock = INVALID_SOCKET;
+            return NULL;
+        }
+    }
+
+    // 是否需要创建目标套接字
+    if (INVALID_SOCKET == session->dst_sock)
+    {
+        // 创建目标套接字
+        session->dst_sock = WSASocketW(pf->dst_addr.addr.sa_family,
+            SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
+        if (INVALID_SOCKET == session->dst_sock)
+        {
+            return NULL;
+        }
+
+        if (SOCKET_ERROR == bind(session->dst_sock,
+            &pf->out_addr.addr, get_sockaddr_len(&pf->out_addr)))
+        {
+            closesocket(session->dst_sock);
+            session->dst_sock = INVALID_SOCKET;
+            return NULL;
+        }
+
+        // 将连接套接字与IOCP关联
+        if (NULL == CreateIoCompletionPort((HANDLE)session->dst_sock, pf->iocp, (ULONG_PTR)pf, 0))
+        {
+            closesocket(session->dst_sock);
+            session->dst_sock = INVALID_SOCKET;
+            return NULL;
+        }
+    }
+
+    return mem;
+}
+
+// 会话池关闭时触发
+static void session_pool_free(pool_t* pool, void* user_data, void* mem)
+{
+    pf_tcp_t* pf = (pf_tcp_t*)user_data;
+    pf_session_t* session = (pf_session_t*)mem;
+
+    if (NULL != session->timeout_timer)
+    {
+        (void)DeleteTimerQueueTimer(pf->timer_queue,
+            session->timeout_timer, INVALID_HANDLE_VALUE);
+        session->timeout_timer = NULL;
+    }
+
+    if (INVALID_SOCKET != session->src_sock)
+    {
+        closesocket(session->src_sock);
+        session->src_sock = INVALID_SOCKET;
+    }
+
+    if (INVALID_SOCKET != session->dst_sock)
+    {
+        closesocket(session->dst_sock);
+        session->dst_sock = INVALID_SOCKET;
+    }
+
+    pool_mem_free(pool, mem);
+}
+
+// 创建会话池
+static pool_t* session_pool_create(pf_tcp_t* pf, size_t max_size)
+{
+    return pool_create(pf, max_size, 0, session_pool_alloc_t, session_pool_reset, session_pool_free);
+}
+
+// 关闭会话池
+static void session_pool_close(pool_t* pool)
+{
+    pool_close(pool);
+}
+
+// 创建会话
+static pf_session_t* session_create(pf_tcp_t* pf)
+{
+    // 池子里取出会话指针
+    pf_session_t* session = (pf_session_t*)pool_get(pf->session_pool);
+
+    // 会话表分配唯一ID
+    session->session_id = table_acquire_id(pf->session_table);
+    if (-1 == session->session_id)
+    {
+        goto ERROR_1;
+    }
+
+    // 写入会话指针
+    if (-1 == table_set(pf->session_table, session->session_id, (uintptr_t)session))
+    {
+        goto ERROR_2;
+    }
+
+    return session;
+
+ERROR_2:
+    table_free_id(pf->session_table, session->session_id);
+ERROR_1:
+    pool_put(pf->session_pool, session);
+    return NULL;
+}
+
 // 增加会话引用
-static void session_addref(pf_session_t* session)
+static void session_ref(pf_session_t* session)
 {
     InterlockedIncrement(&session->ref);
 }
 
-// 增加会话线程引用
-static void session_io_addref(pf_session_t* session)
+// 会话加锁
+static void session_io_lock(pf_session_t* session)
 {
-    InterlockedIncrement(&session->io_ref);
+    UINT spin_count = 0;
+    for (;;)
+    {
+        LONG current = InterlockedCompareExchange(&session->lock, 0, 0);
+        if (-1 == current)
+        {
+            // 独占锁
+            if (spin_count++ < 8000)
+            {
+                // 短暂让出CPU
+                YieldProcessor();
+            }
+            else
+            {
+                // 让出CPU
+                spin_count = 0;
+                Sleep(0);
+            }
+            
+            continue;
+        }
+
+        // 尝试原子增加计数(current = current + 1)
+        if (current == InterlockedCompareExchange(&session->lock, current + 1, current))
+        {
+            // 加锁成功
+            break;
+        }
+    }
 }
 
-// 减少会话线程引用
-static void session_io_release(pf_session_t* session)
+// 会话解锁
+static void session_io_unlock(pf_session_t* session)
 {
-    LONG flags = 0;
-    if (0 == InterlockedDecrement(&session->io_ref))
+    for (;;)
     {
-        flags = InterlockedCompareExchange(&session->close_flags, 0, 0);
-        if (0 == flags)
+        // 尝试原子减少计数(current = current - 1)，= 0 时进入独占锁
+        LONG current = InterlockedCompareExchange(&session->lock, 0, 0);
+        if (current == InterlockedCompareExchange(&session->lock, current > 1 ? current - 1 : -1, current))
         {
-            return;
-        }
+            // 独占锁
+            // 安全关闭套接字
+            LONG flags = InterlockedCompareExchange(&session->close_flags, 0, 0);
+            if (PF_SESSION_CLOSE == (flags & PF_SESSION_CLOSE))
+            {
+                // 强制关闭套接字
+                if (PF_SESSION_CLOSE_END != (flags & PF_SESSION_CLOSE_END))
+                {
+                    InterlockedOr(&session->close_flags, PF_SESSION_CLOSE_END);
+                    if (INVALID_SOCKET != session->src_sock)
+                    {
+                        closesocket(session->src_sock);
+                        session->src_sock = INVALID_SOCKET;
+                    }
+                    if (INVALID_SOCKET != session->dst_sock)
+                    {
+                        closesocket(session->dst_sock);
+                        session->dst_sock = INVALID_SOCKET;
+                    }
+                }
+            }
 
-        if (PF_SESSION_CLOSE == (flags & PF_SESSION_CLOSE))
-        {
-            // 强制关闭
-            if (INVALID_SOCKET != session->src_sock)
+            // 源端读到了 FIN (bytes==0)，需要向目标端发送 FIN
+            if (PF_SESSION_SRC_CLOSE == (flags & PF_SESSION_SRC_CLOSE))
             {
-                closesocket(session->src_sock);
-                session->src_sock = INVALID_SOCKET;
+                if (PF_SESSION_SRC_CLOSE_END != (flags & PF_SESSION_SRC_CLOSE_END))
+                {
+                    InterlockedOr(&session->close_flags, PF_SESSION_SRC_CLOSE_END);
+                    if (INVALID_SOCKET != session->dst_sock)
+                    {
+                        shutdown(session->dst_sock, SD_SEND);
+                    }
+                }
             }
-            if (INVALID_SOCKET != session->dst_sock)
+
+            // 目标端读到了 FIN (bytes==0)，需要向源端发送 FIN
+            if (PF_SESSION_DST_CLOSE == (flags & PF_SESSION_DST_CLOSE))
             {
-                closesocket(session->dst_sock);
-                session->dst_sock = INVALID_SOCKET;
+                if (PF_SESSION_DST_CLOSE_END != (flags & PF_SESSION_DST_CLOSE_END))
+                {
+                    InterlockedOr(&session->close_flags, PF_SESSION_DST_CLOSE_END);
+                    if (INVALID_SOCKET != session->src_sock)
+                    {
+                        shutdown(session->src_sock, SD_SEND);
+                    }
+                }
             }
-        }
-        else if ((PF_SESSION_SRC_CLOSE == (flags & PF_SESSION_SRC_CLOSE)) && (PF_SESSION_DST_CLOSE == (flags & PF_SESSION_DST_CLOSE)))
-        {
-            // 源与目标已关闭
-            if (INVALID_SOCKET != session->dst_sock)
-            {
-                shutdown(session->dst_sock, SD_SEND);
-            }
-            if (INVALID_SOCKET != session->src_sock)
-            {
-                shutdown(session->src_sock, SD_SEND);
-            }
-        }
-        else if (PF_SESSION_SRC_CLOSE == (flags & PF_SESSION_SRC_CLOSE))
-        {
-            // 源已关闭，半关闭目标连接的发送
-            if (INVALID_SOCKET != session->dst_sock)
-            {
-                shutdown(session->dst_sock, SD_SEND);
-            }
-        }
-        else if (PF_SESSION_DST_CLOSE == (flags & PF_SESSION_DST_CLOSE))
-        {
-            // 目标已关闭，半关闭源连接的发送
-            if (INVALID_SOCKET != session->src_sock)
-            {
-                shutdown(session->src_sock, SD_SEND);
-            }
+
+            // 解锁
+            InterlockedExchange(&session->lock, 0);
+            break;
         }
     }
 }
@@ -1379,7 +1657,7 @@ static void session_cancel_timeout(pf_session_t* session)
     if (PF_SESSION_TIMEOUT_START == InterlockedCompareExchange(&session->timeout_status, PF_SESSION_TIMEOUT_END, PF_SESSION_TIMEOUT_START))
     {
         PostQueuedCompletionStatus(pf->iocp, 0, (ULONG_PTR)pf, &session->tmo_io.overlapped);
-        (void)ChangeTimerQueueTimer(pf->timer_queue, session->timeout_timer, INFINITE, 0);
+        (void)ChangeTimerQueueTimer(pf->timer_queue, session->timeout_timer, INFINITE, INFINITE);
         InterlockedExchange(&session->timeout_status, PF_SESSION_TIMEOUT_NONE);
     }
 }
@@ -1389,33 +1667,9 @@ static void session_release(pf_session_t* session)
 {
     if (0 == InterlockedDecrement(&session->ref))
     {
-        session_free(session);
+        pf_tcp_t* pf = session->pf;
+        table_free_id(pf->session_table, session->session_id);
+        (void)ChangeTimerQueueTimer(pf->timer_queue, session->timeout_timer, INFINITE, INFINITE);
+        pool_put(pf->session_pool, session);
     }
-}
-
-// 强制释放
-static void session_free(pf_session_t* session)
-{
-    table_free_id(session->pf->session_table, session->session_id);
-
-    if (NULL != session->timeout_timer)
-    {
-        (void)DeleteTimerQueueTimer(session->pf->timer_queue,
-            session->timeout_timer, INVALID_HANDLE_VALUE);
-        session->timeout_timer = NULL;
-    }
-
-    if (INVALID_SOCKET != session->src_sock)
-    {
-        closesocket(session->src_sock);
-        session->src_sock = INVALID_SOCKET;
-    }
-
-    if (INVALID_SOCKET != session->dst_sock)
-    {
-        closesocket(session->dst_sock);
-        session->dst_sock = INVALID_SOCKET;
-    }
-
-    free(session);
 }
