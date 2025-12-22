@@ -263,7 +263,7 @@ pf_tcp_t* pf_tcp_create(pf_config_t* config)
         goto ERROR_4;
     }
 
-    pf->session_pool = session_pool_create(pf, 4096);
+    pf->session_pool = session_pool_create(pf, 256);
     if (NULL == pf->session_pool)
     {
         goto ERROR_5;
@@ -1501,9 +1501,9 @@ static void session_pool_free(pool_t* pool, void* user_data, void* mem)
 }
 
 // 创建会话池
-static pool_t* session_pool_create(pf_tcp_t* pf, size_t max_size)
+static pool_t* session_pool_create(pf_tcp_t* pf, size_t min_size)
 {
-    return pool_create(pf, max_size, 0, session_pool_alloc_t, session_pool_reset, session_pool_free);
+    return pool_create(pf, min_size, 0, session_pool_alloc_t, session_pool_reset, session_pool_free);
 }
 
 // 关闭会话池

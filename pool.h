@@ -20,8 +20,8 @@ extern "C" {
     // 内存池关闭时触发
     typedef void (*pool_free_t)(pool_t* pool, void* user_data, void* mem);
 
-    // 创建内存池，max_size: 最大数量，alignment: 内存对齐
-    pool_t* pool_create(void* user_data, size_t max_size, size_t alignment, pool_alloc_t alloc, pool_reset_t reset, pool_free_t free);
+    // 创建内存池，min_size: 最小数量，alignment: 内存对齐
+    pool_t* pool_create(void* user_data, size_t min_size, size_t alignment, pool_alloc_t alloc, pool_reset_t reset, pool_free_t free);
 
     // 关闭内存池
     void pool_close(pool_t* pool);

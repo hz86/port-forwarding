@@ -7,14 +7,16 @@
 // 内存池
 typedef struct pool_t {
     SLIST_HEADER head;
-    volatile size_t size;
+    volatile size_t pool_size;
+    volatile size_t active_count;
+    volatile LONG cleanup;
+    size_t min_size;
+    size_t node_size;
+    size_t alignment;
     pool_alloc_t alloc;
     pool_reset_t reset;
     pool_free_t free;
     void* user_data;
-    size_t max_size;
-    size_t node_size;
-    size_t alignment;
 } pool_t;
 
 // 内存池节点
@@ -23,7 +25,7 @@ typedef struct pool_node_t {
 } pool_node_t;
 
 // 创建内存池
-pool_t* pool_create(void* user_data, size_t max_size, size_t alignment, pool_alloc_t alloc, pool_reset_t reset, pool_free_t free)
+pool_t* pool_create(void* user_data, size_t min_size, size_t alignment, pool_alloc_t alloc, pool_reset_t reset, pool_free_t free)
 {
     pool_t* pool = (pool_t*)_aligned_malloc(sizeof(pool_t), MEMORY_ALLOCATION_ALIGNMENT);
     if (NULL == pool)
@@ -39,12 +41,14 @@ pool_t* pool_create(void* user_data, size_t max_size, size_t alignment, pool_all
     InitializeSListHead(&pool->head);
     pool->node_size = ((sizeof(SLIST_ENTRY) + alignment - 1) & ~(alignment - 1));
     pool->alignment = alignment <= MEMORY_ALLOCATION_ALIGNMENT ? MEMORY_ALLOCATION_ALIGNMENT : alignment;
-    pool->max_size = max_size;
+    pool->min_size = min_size;
     pool->user_data = user_data;
     pool->alloc = alloc;
     pool->reset = reset;
     pool->free = free;
-    pool->size = 0;
+    pool->active_count = 0;
+    pool->pool_size = 0;
+    pool->cleanup = 0;
     return pool;
 }
 
@@ -97,7 +101,8 @@ void* pool_get(pool_t* pool)
     pool_node_t* node = (pool_node_t*)InterlockedPopEntrySList(&pool->head);
     if (NULL != node)
     {
-        InterlockedDecrementSizeT(&pool->size);
+        InterlockedDecrementSizeT(&pool->pool_size);
+        InterlockedIncrementSizeT(&pool->active_count);
         mem = (void*)((char*)node + pool->node_size);
         return mem;
     }
@@ -105,6 +110,7 @@ void* pool_get(pool_t* pool)
     mem = pool->alloc(pool, pool->user_data);
     if (NULL != mem)
     {
+        InterlockedIncrementSizeT(&pool->active_count);
         return mem;
     }
     
@@ -114,22 +120,49 @@ void* pool_get(pool_t* pool)
 // 放回内存池
 void pool_put(pool_t* pool, void* mem)
 {
-    size_t new_size = InterlockedIncrementSizeT(&pool->size);
-    if (new_size > pool->max_size)
+    size_t current_size = InterlockedExchangeAddSizeT(&pool->pool_size, 0);
+    size_t current_active = InterlockedDecrementSizeT(&pool->active_count);
+    size_t max_allowed = current_active / 5;
+    if (max_allowed < pool->min_size)
     {
-        InterlockedDecrementSizeT(&pool->size);
+        max_allowed = pool->min_size;
+    }
+
+    if (current_size > max_allowed)
+    {
         pool->free(pool, pool->user_data, mem);
+        if (0 == InterlockedCompareExchange(&pool->cleanup, 1, 0))
+        {
+            size_t count = (current_size - max_allowed) / 2;
+            for (size_t i = 0; i < count; i++)
+            {
+                pool_node_t* node = (pool_node_t*)InterlockedPopEntrySList(&pool->head);
+                if (NULL != node)
+                {
+                    InterlockedDecrementSizeT(&pool->pool_size);
+                    void* gc_mem = (void*)((char*)node + pool->node_size);
+                    pool->free(pool, pool->user_data, gc_mem);
+                }
+                else
+                {
+                    break;
+                }
+            }
+
+            InterlockedExchange(&pool->cleanup, 0);
+        }
+
         return;
     }
 
     void* new_mem = pool->reset(pool, pool->user_data, mem);
     if (NULL != new_mem)
     {
+        InterlockedIncrementSizeT(&pool->pool_size);
         pool_node_t* node = (pool_node_t*)((char*)new_mem - pool->node_size);
         InterlockedPushEntrySList(&pool->head, (SLIST_ENTRY*)node);
         return;
     }
 
-    InterlockedDecrementSizeT(&pool->size);
     pool->free(pool, pool->user_data, mem);
 }
