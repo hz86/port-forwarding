@@ -4,6 +4,36 @@
 #include <stdlib.h>
 #include "pool.h"
 
+#ifdef _WIN64
+
+#ifndef InterlockedOrSizeT
+#define InterlockedOrSizeT(a, b) InterlockedOr64((LONG64 *)a, b)
+#endif
+
+#ifndef InterlockedIncrementSizeT
+#define InterlockedIncrementSizeT(a) InterlockedIncrement64((LONG64 *)a)
+#endif
+
+#ifndef InterlockedDecrementSizeT
+#define InterlockedDecrementSizeT(a) InterlockedDecrement64((LONG64 *)a)
+#endif
+
+#elif _WIN32
+
+#ifndef InterlockedOrSizeT
+#define InterlockedOrSizeT(a, b) InterlockedOr((LONG *)a, b)
+#endif
+
+#ifndef InterlockedIncrementSizeT
+#define InterlockedIncrementSizeT(a) InterlockedIncrement((LONG *)a)
+#endif
+
+#ifndef InterlockedDecrementSizeT
+#define InterlockedDecrementSizeT(a) InterlockedDecrement((LONG *)a)
+#endif
+
+#endif
+
 // 内存池
 typedef struct pool_t {
     SLIST_HEADER head;
@@ -13,9 +43,9 @@ typedef struct pool_t {
     size_t min_size;
     size_t node_size;
     size_t alignment;
-    pool_alloc_t alloc;
-    pool_reset_t reset;
-    pool_free_t free;
+    pool_alloc_cb alloc;
+    pool_reset_cb reset;
+    pool_free_cb free;
     void* user_data;
 } pool_t;
 
@@ -25,7 +55,7 @@ typedef struct pool_node_t {
 } pool_node_t;
 
 // 创建内存池
-pool_t* pool_create(void* user_data, size_t min_size, size_t alignment, pool_alloc_t alloc, pool_reset_t reset, pool_free_t free)
+pool_t* pool_create(void* user_data, size_t min_size, size_t alignment, pool_alloc_cb alloc, pool_reset_cb reset, pool_free_cb free)
 {
     pool_t* pool = (pool_t*)_aligned_malloc(sizeof(pool_t), MEMORY_ALLOCATION_ALIGNMENT);
     if (NULL == pool)
@@ -120,7 +150,7 @@ void* pool_get(pool_t* pool)
 // 放回内存池
 void pool_put(pool_t* pool, void* mem)
 {
-    size_t current_size = InterlockedExchangeAddSizeT(&pool->pool_size, 0);
+    size_t current_size = InterlockedOrSizeT(&pool->pool_size, 0);
     size_t current_active = InterlockedDecrementSizeT(&pool->active_count);
     size_t max_allowed = current_active / 5;
     if (max_allowed < pool->min_size)
@@ -133,7 +163,7 @@ void pool_put(pool_t* pool, void* mem)
         pool->free(pool, pool->user_data, mem);
         if (0 == InterlockedCompareExchange(&pool->cleanup, 1, 0))
         {
-            size_t count = (current_size - max_allowed) / 2;
+            size_t count = (current_size - max_allowed) / 10;
             for (size_t i = 0; i < count; i++)
             {
                 pool_node_t* node = (pool_node_t*)InterlockedPopEntrySList(&pool->head);

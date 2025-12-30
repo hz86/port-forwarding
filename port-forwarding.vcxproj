@@ -124,12 +124,14 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="main.c" />
-    <ClCompile Include="table.c" />
     <ClCompile Include="tcp-fwding.c" />
+    <ClCompile Include="hashmap.c" />
+    <ClCompile Include="pool.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="fwding.h" />
-    <ClInclude Include="table.h" />
+    <ClInclude Include="hashmap.h" />
+    <ClInclude Include="pool.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

@@ -12,16 +12,18 @@ extern "C" {
     typedef struct pool_t pool_t;
 
     // 内存池空时触发申请操作，内存需 pool_mem_alloc 申请
-    typedef void* (*pool_alloc_t)(pool_t* pool, void* user_data);
+    typedef void* (*pool_alloc_cb)(pool_t* pool, void* user_data);
 
     // 内存池回收时触发重置操作，重置失败返回NULL
-    typedef void* (*pool_reset_t)(pool_t* pool, void* user_data, void* mem);
+    typedef void* (*pool_reset_cb)(pool_t* pool, void* user_data, void* mem);
 
     // 内存池关闭时触发
-    typedef void (*pool_free_t)(pool_t* pool, void* user_data, void* mem);
+    typedef void (*pool_free_cb)(pool_t* pool, void* user_data, void* mem);
 
     // 创建内存池，min_size: 最小数量，alignment: 内存对齐
-    pool_t* pool_create(void* user_data, size_t min_size, size_t alignment, pool_alloc_t alloc, pool_reset_t reset, pool_free_t free);
+    pool_t* pool_create(void* user_data, size_t min_size, size_t alignment, 
+        pool_alloc_cb alloc, pool_reset_cb reset, pool_free_cb free
+    );
 
     // 关闭内存池
     void pool_close(pool_t* pool);

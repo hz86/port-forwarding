@@ -62,7 +62,7 @@
 #include <windows.h>
 
 #include "pool.h"
-#include "table.h"
+#include "hashmap.h"
 #include "fwding.h"
 
 #pragma comment(lib, "ws2_32.lib")
@@ -132,7 +132,7 @@ typedef struct pf_tcp_t {
     HANDLE iocp;                    // IOCP句柄
     HANDLE timer_queue;             // 定时器队列
     pool_t* session_pool;           // 会话池
-    table_t* session_table;         // 会话表
+    hashmap_t* session_table;       // 会话表
     SOCKET listen_sock;             // 监听套接字
     LPFN_ACCEPTEX acceptex;         // 扩展接口
     LPFN_CONNECTEX connectex;       // 扩展接口
@@ -155,7 +155,7 @@ typedef struct pf_session_t {
     volatile LONG close_flags;    // 关闭标志
     volatile LONG timeout_status; // 超时状态
 
-    ssize_t session_id;           // 唯一会话ID
+    hashmap_node_t hashmap_node;  // 哈希表节点
     HANDLE timeout_timer;         // 定时器句柄
     pf_tcp_t* pf;                 // 父指针
 
@@ -188,6 +188,7 @@ static int post_timeout(pf_tcp_t* pf, pf_session_t* session);
 static int post_disconnect(pf_tcp_t* pf, pf_session_t* session, pf_io_type_t type);
 static int post_recv(pf_tcp_t* pf, pf_session_t* session, pf_io_type_t type);
 static int post_send(pf_tcp_t* pf, pf_session_t* session, pf_io_type_t type, int bytes_transferred, int offset);
+static int session_table_compare(hashmap_node_t* a, hashmap_node_t* b);
 static int parse_ip_addr(const char* ip, unsigned short port, pf_sockaddr_t* addr);
 static int get_sockaddr_len(pf_sockaddr_t* sockaddr);
 static pool_t* session_pool_create(pf_tcp_t* pf, size_t max_size);
@@ -263,13 +264,13 @@ pf_tcp_t* pf_tcp_create(pf_config_t* config)
         goto ERROR_4;
     }
 
-    pf->session_pool = session_pool_create(pf, 256);
+    pf->session_pool = session_pool_create(pf, 1024);
     if (NULL == pf->session_pool)
     {
         goto ERROR_5;
     }
 
-    pf->session_table = table_create(16, 8192);
+    pf->session_table = hashmap_create(1024, 75, session_table_compare);
     if (NULL == pf->session_table)
     {
         goto ERROR_6;
@@ -292,7 +293,7 @@ pf_tcp_t* pf_tcp_create(pf_config_t* config)
     return pf;
 
 ERROR_7:
-    table_close(pf->session_table);
+    hashmap_close(pf->session_table);
 ERROR_6:
     session_pool_close(pf->session_pool);
 ERROR_5:
@@ -321,7 +322,7 @@ void pf_tcp_destroy(pf_tcp_t* pf)
     }
 
     CloseHandle(pf->iocp);
-    table_close(pf->session_table);
+    hashmap_close(pf->session_table);
     session_pool_close(pf->session_pool);
     (void)DeleteTimerQueueEx(pf->timer_queue, INVALID_HANDLE_VALUE);
     free(pf->thread_workers);
@@ -965,17 +966,18 @@ static DWORD WINAPI thread_worker_callback(LPVOID param)
         }
 
         // 关闭所有会话
+        hashmap_iterator_t iter;
         pf_session_t* curr_session = NULL;
-        ssize_t count = table_max_id(pf->session_table) + 1;
-        for (ssize_t i = 0; i < count; i++)
+        hashmap_node_t* curr = hashmap_iterate_begin(pf->session_table, &iter);
+        while (NULL != curr)
         {
-            if (-1 != table_get(pf->session_table, i, (uintptr_t*)&curr_session))
-            {
-                session_io_lock(curr_session);
-                session_request_close(curr_session, PF_SESSION_CLOSE);
-                session_io_unlock(curr_session);
-            }
+            curr_session = (pf_session_t*)curr->value;
+            curr = hashmap_iterate_next(&iter);
+            session_io_lock(curr_session);
+            session_request_close(curr_session, PF_SESSION_CLOSE);
+            session_io_unlock(curr_session);
         }
+        hashmap_iterate_end(&iter);
 
         // 释放内存
         while (0 != InterlockedCompareExchange(&pf->post_count, 0, 0))
@@ -1044,6 +1046,14 @@ static int get_sockaddr_len(pf_sockaddr_t* sockaddr)
     {
         return 0;
     }
+}
+
+// 哈希表KEY比较
+static int session_table_compare(hashmap_node_t* a, hashmap_node_t* b)
+{
+    if (a->keylen > b->keylen) return 1;
+    else if (a->keylen < b->keylen) return -1;
+    else return memcmp(a->keyname, b->keyname, b->keylen);
 }
 
 // 投递Accept
@@ -1315,7 +1325,6 @@ static void* session_pool_alloc_t(pool_t* pool, void* user_data)
     // 初始化
     session->ref = 1;
     session->lock = 0;
-    session->session_id = -1;
     session->close_flags = PF_SESSION_NONE;
     session->timeout_status = PF_SESSION_TIMEOUT_NONE;
     session->pf = pf;
@@ -1336,6 +1345,11 @@ static void* session_pool_alloc_t(pool_t* pool, void* user_data)
     session->src_io.session = session;
     session->dst_io.session = session;
     session->tmo_io.session = session;
+
+    memset(&session->hashmap_node, 0, sizeof(hashmap_node_t));
+    session->hashmap_node.keyname = &session->hashmap_node.value;
+    session->hashmap_node.keylen = sizeof(void*);
+    session->hashmap_node.value = session;
 
     // 创建源套接字
     session->src_sock = WSASocketW(pf->src_addr.addr.sa_family,
@@ -1400,7 +1414,6 @@ static void* session_pool_reset(pool_t* pool, void* user_data, void* mem)
     // 重新初始化
     session->ref = 1;
     session->lock = 0;
-    session->session_id = -1;
     session->close_flags = PF_SESSION_NONE;
     session->timeout_status = PF_SESSION_TIMEOUT_NONE;
 
@@ -1420,6 +1433,11 @@ static void* session_pool_reset(pool_t* pool, void* user_data, void* mem)
     session->src_io.session = session;
     session->dst_io.session = session;
     session->tmo_io.session = session;
+
+    memset(&session->hashmap_node, 0, sizeof(hashmap_node_t));
+    session->hashmap_node.keyname = &session->hashmap_node.value;
+    session->hashmap_node.keylen = sizeof(void*);
+    session->hashmap_node.value = session;
 
     // 是否需要创建源套接字
     if (INVALID_SOCKET == session->src_sock)
@@ -1518,23 +1536,15 @@ static pf_session_t* session_create(pf_tcp_t* pf)
     // 池子里取出会话指针
     pf_session_t* session = (pf_session_t*)pool_get(pf->session_pool);
 
-    // 会话表分配唯一ID
-    session->session_id = table_acquire_id(pf->session_table);
-    if (-1 == session->session_id)
+    // 会话指针加入会话表中
+    hashmap_node_t* hashmap_node = &session->hashmap_node;
+    if (hashmap_node != hashmap_insert(pf->session_table, hashmap_node))
     {
         goto ERROR_1;
     }
 
-    // 写入会话指针
-    if (-1 == table_set(pf->session_table, session->session_id, (uintptr_t)session))
-    {
-        goto ERROR_2;
-    }
-
     return session;
 
-ERROR_2:
-    table_free_id(pf->session_table, session->session_id);
 ERROR_1:
     pool_put(pf->session_pool, session);
     return NULL;
@@ -1668,7 +1678,7 @@ static void session_release(pf_session_t* session)
     if (0 == InterlockedDecrement(&session->ref))
     {
         pf_tcp_t* pf = session->pf;
-        table_free_id(pf->session_table, session->session_id);
+        hashmap_remove(pf->session_table, &session->hashmap_node);
         (void)ChangeTimerQueueTimer(pf->timer_queue, session->timeout_timer, INFINITE, INFINITE);
         pool_put(pf->session_pool, session);
     }
