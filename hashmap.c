@@ -540,19 +540,23 @@ hashmap_node_t* hashmap_iterate_begin(hashmap_t* map, hashmap_iterator_t* iter)
     iter->next_node = NULL;
     iter->next_index = 0;
 
-    hashmap_node_t* result = NULL;
     AcquireSRWLockExclusive(&map->lock);
+    iter->next = map->iter_head;
+    map->iter_head = iter;
+    ReleaseSRWLockExclusive(&map->lock);
+
+    hashmap_node_t* result = NULL;
+    AcquireSRWLockShared(&map->lock);
 
     iter->is_old_table = HASHMAP_REHASH == map->status;
     if (0 != iter->is_old_table) iter->next_index = map->move_index;
+    if (map->size > 0)
+    {
+        result = iter->next_node = hashmap_iterate_find_next(iter);
+        if (NULL != result) iter->next_node = hashmap_iterate_find_next(iter);
+    }
 
-    result = iter->next_node = hashmap_iterate_find_next(iter);
-    if (NULL != result) iter->next_node = hashmap_iterate_find_next(iter);
-    
-    iter->next = map->iter_head;
-    map->iter_head = iter;
-
-    ReleaseSRWLockExclusive(&map->lock);
+    ReleaseSRWLockShared(&map->lock);
     return result;
 }
 
